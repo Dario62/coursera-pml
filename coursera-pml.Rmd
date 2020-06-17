@@ -1,0 +1,319 @@
+---
+title: "Practical Machine Learning - Prediction Assignment"
+author: "Dario Romare"
+date: "June 17, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Task
+
+The goal is to predict the manner in which a group of volunteers perform a specific physical exercise
+(arm curl) using data from accelerometers on the belt, forearm, arm, and dumbell as possible predictors.
+The `classe` variable represents the target and can assume one of the following values: A, B, C, D or E.
+
+For this analysis it is assumed that all necessary packages are already installed, in particular: `data.table`, `rattle`, `knitr`, `caret` and related ML packages (`rpart`, `randomForest`, `gbm`).
+
+## Load Input Data
+
+The training dataset will be used to train and validate models, while the test dataset of 20 measurements will be used to make final predictions for the 'Prediction Quiz' questionnaire:
+
+```{r, message=FALSE}
+library(data.table)
+# Load training dataset
+trn_data <- setDT(fread('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'))
+print(paste('Size of training dataset:', nrow(trn_data),'X',ncol(trn_data)))
+# Load test dataset
+tst_data <- setDT(fread('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'))
+print(paste('Size of test dataset:', nrow(tst_data),'X',ncol(tst_data)))
+# Set the seed number for reproducible results
+SEED_NUM = 1234
+```
+
+## Exploratory Data Analysis
+
+Both training and test datasets have 160 variables. The variable names coincide except for the last one, this is the `classe` variable in the training set, and the `problem_id` variable in the test set:
+
+```{r}
+# Confirm all variable names but one are the same in the two sets
+all(names(tst_data)[-160]==names(trn_data)[-160])
+# Display unique values of target variable in training set
+unique(trn_data$classe)
+# Convert target variable to factor
+trn_data[,classe := factor(classe)]
+# Display "problem_id" variable values in test set
+tst_data$problem_id
+```
+The following variables are descriptors of each measurement and can therefore be discarded from the set of possible predictors:
+
+```{r}
+names(trn_data)[1:7]
+trn_data[,1:7 := NULL]
+```
+
+We should probably run some data consistency checks, but we do not have the sensor specifications that would allow us to define the acceptable range for each variable, in order to spot invalid values, e.g., wrong sign or outliers.
+
+## Training and Validation Subsets
+
+We partition the training dataset into proper training and validation subsets. The training subset will be used for feature selection, preprocessing, and training of classification algorithms. The validation set will not be explored, and will only be used to assess the expected out of sample error.
+
+```{r, message=FALSE}
+library(caret)
+# Set the seed for reproducible results
+set.seed(SEED_NUM)
+# Perform a 60-40 split of the training set, different splits may give different results 
+inTrain <- createDataPartition(y=trn_data$classe, p=0.60, list=FALSE)
+training <- trn_data[inTrain]
+valid  <- trn_data[-inTrain]
+```
+
+The `classe` categories are well balanced between training and validation subsets, the ratio of the number of each category being the same as the 60/40 ratio of total measurements:
+
+```{r}
+table(training$classe)
+table(valid$classe)
+round(table(training$classe)/table(valid$classe), 2)
+```
+
+## Handle Missing Values (Look at Training Subset Only)
+
+There are no missing values in the target variable. However, there are 100 possible predictors having more than 10% of missing values; not only, these same predictors have more than 98% of missing values, hence they can safely be discarded from the training set. We end up with no missing values at all, hence there is no need to either discard measurements or impute missing values.
+
+```{r}
+print(paste('Number of missing values in target variable:', sum(is.na(training$classe))))
+pct_na <- sapply(training, function(x) 100*sum(is.na(x))/nrow(training))
+print(paste('Range of % of missing values in predictors:', paste0('[',min(pct_na),',',max(pct_na),']')))
+print(paste('Number of predictors with more than 10% of missing values:', length(which(pct_na > 10))))
+print(paste('Number of predictors with more than 98% of missing values:', length(which(pct_na > 98))))
+# Identify predictors to remove from training subset
+nms <- which(pct_na > 10)
+# Remove such predictors from the training subset
+training[,(nms) := NULL]
+# Final check for missing values
+print(paste('Number of missing values in training set:', sum(is.na(training))))
+```
+
+## Near-Zero-Variance Predictors (Look at Training Subset Only)
+
+All remaining predictors have enough variability:
+
+```{r}
+nsv <- nearZeroVar(training[,-"classe"])
+print(paste('Number of zero or near-zero variance predictors in training set:', length(nsv)))
+```
+
+## Highly Correlated Predictors (Look at Training Subset Only)
+
+There are some very high correlations between pairs of predictors. We set a threshold of 0.8 to discard 13 redundant predictors, this is quite an arbitrary cutoff (e.g., a threshold of 0.9 would eliminate 7 predictors, while a threshold of 0.7 would eliminate 21 predictors):
+
+```{r}
+nms <- findCorrelation(cor(training[,-"classe"]), cutoff=0.8, names=TRUE)
+if (length(nms)) {
+  print(paste('Number of  columns to remove to reduce pair-wise correlations:', length(nms)))
+  training[,(nms) := NULL]
+}
+```
+We check that pairwise correlations among the remaining predictors are below 0.8:
+
+```{r}
+M <- cor(training[,-"classe"]); diag(M) <- 0
+print(paste('Maximum remaining pairwise correlations between', round(min(M), 2), 'and', round(max(M), 2)))
+```
+
+## Standardization (Look at Training Subset Only)
+
+The predictors are all numeric (integer or real numbers). None is categorical, hence there is no need to create dummy variables. However, they are not on the same scale, so we will include standardization as a preprocessing option when building models on the training subset:
+
+
+```{r}
+unique(sapply(training[,-"classe"], class))
+round(range(sapply(training[,-"classe"], mean)), 2)
+round(range(sapply(training[,-"classe"], function(x) abs(mean(x)))), 2)
+round(range(sapply(training[,-"classe"], function(x) abs(sd(x)))), 2)
+```
+
+## Model Building and Validation
+
+Models will be built using the training subset, and validated on the validation subset. We will consider three tree-based algorithms and compare their performance on the training and validation subsets. Hyperparameter tuning will be performed on the training subset using 10-fold cross-validation.
+
+Some of the advantages of tree-based algorithms are:
+
+(a) They do not require data transformations, this includes making predictors Normal (something that we did not explore) or scaling (something that we did explore)
+(b) They are robust to outliers (something that we did not explore)
+(c) They are robust to correlated predictors (something that we did explore)
+
+```{r}
+print(paste('Size of training subset:', nrow(training),'X',ncol(training)))
+# Setup for 10-fold CV
+fitControl <- trainControl(method="cv", number=10)
+```
+
+### 1. Predicting With Decision Trees (CART)
+
+Note: may need to install package 'rpart' first.
+
+```{r}
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_rpart <- train(classe ~., data=training, method="rpart", trControl=fitControl, preProcess=c("center","scale")))
+train_pred <- predict(model_rpart, newdata=training)
+valid_pred  <- predict(model_rpart, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training$classe))/length(training$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+The accuracy is not great. We plot the decision tree and we notice that the decisions are based on only 5 predictors:
+
+```{r, message=FALSE}
+library(rattle)
+fancyRpartPlot(model_rpart$finalModel, main="")
+```
+
+We build a simpler model based on these 5 predictors:
+
+```{r}
+nms_rpart <- c('pitch_forearm', 'magnet_belt_y', 'magnet_dumbbell_y', 'roll_forearm', 'accel_forearm_x', 'classe')
+training1 <- training[,(nms_rpart), with=FALSE]
+M <- cor(training1[,-"classe"]); diag(M) <- 0
+print(paste('Maximum pairwise correlations between', round(min(M), 2), 'and', round(max(M), 2)))
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_rpart1 <- train(classe ~., data=training1, method="rpart", trControl=fitControl, preProcess=c("center","scale")))
+train_pred <- predict(model_rpart1, newdata=training1)
+valid_pred  <- predict(model_rpart1, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training1$classe))/length(training1$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+The reduced model has the same accuracy as the full model, it runs faster, and is based on predictors containing much less redundancy.
+
+### 2. Predicting With Random Forests
+
+Note: may need to install package 'randomForest' first.
+
+We reduce the number of trees from 500 (default) to 100 to reduce the execution time. We are also interested in obtaining the importance of predictors on the training subset.
+
+```{r}
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_rf <- train(classe ~., data=training, method="rf", ntree=100, trControl=fitControl, preProcess=c("center","scale"), importance=TRUE))
+train_pred <- predict(model_rf, newdata=training)
+valid_pred  <- predict(model_rf, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training$classe))/length(training$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+All `classe` categories are correctly classified in the training subset:
+
+```{r}
+table(train_pred, training$classe)
+```
+
+Less than 1 % of class labels are misclassified in the validation subset:
+
+```{r}
+conf_matrix <- table(valid_pred, valid$classe)
+print(paste('Number of misclassifications in validation subset:', sum(conf_matrix)-sum(diag(conf_matrix)), 'out of', sum(conf_matrix)))
+print(paste('Percentage of misclassifications in validation subset:', round(100*(sum(conf_matrix)-sum(diag(conf_matrix)))/sum(conf_matrix), 2)))
+```
+
+We build a simpler model based on the 8 most important predictors:
+
+```{r}
+varImp(model_rf)
+nms_rf <- c('magnet_dumbbell_z', 'roll_arm', 'yaw_belt', 'accel_dumbbell_y',
+            'magnet_dumbbell_y', 'yaw_forearm', 'gyros_belt_z', 'magnet_belt_x', 'classe')
+training1 <- training[,(nms_rf), with=FALSE]
+M <- cor(training1[,-"classe"]); diag(M) <- 0
+print(paste('Maximum pairwise correlations between', round(min(M), 2), 'and', round(max(M), 2)))
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_rf1 <- train(classe ~., data=training1, method="rf", ntree=100, trControl=fitControl, preProcess=c("center","scale")))
+train_pred <- predict(model_rf1, newdata=training1)
+valid_pred  <- predict(model_rf1, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training1$classe))/length(training1$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+Note that there is only one predictor in common with the reduced CART model:
+
+```{r}
+print(paste('Predictors in common between reduced Random Forests and CART models:',
+            paste0(setdiff(intersect(nms_rf, nms_rpart), "classe"), collapse=', ')))
+```
+
+The reduced model loses a little bit of accuracy on the validation set, but it runs noticeably faster and is based on predictors containing much less redundancy. One could try increasing the number of trees and/or using a different number of most important predictors in an attempt to get slightly better performance on the validation set.
+
+### 3. Predicting With Boosted Trees
+
+Note: may need to install package 'gbm' first.
+
+```{r}
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_gbm <- train(classe ~., data=training, method="gbm", trControl=fitControl, verbose=FALSE, preProcess=c("center","scale")))
+train_pred <- predict(model_gbm, newdata=training)
+valid_pred  <- predict(model_gbm, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training$classe))/length(training$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+Performance on both training and validation subsets is slightly inferior to Random Forests, and execution time is higher.
+
+We build a simpler model based on the 8 most important predictors; on a scale of 0 to 100 %, the least important of these 8 predictors has a relative importance of 35 % with respect to the most important one:
+
+```{r, message=FALSE}
+library(gbm)
+```
+```{r}
+varImp(model_gbm)
+nms_gbm <- c('yaw_belt', 'pitch_forearm', 'magnet_dumbbell_z', 'gyros_belt_z',
+             'magnet_belt_z', 'magnet_belt_y', 'roll_forearm', 'magnet_dumbbell_y', 'classe')
+training1 <- training[,(nms_gbm), with=FALSE]
+M <- cor(training1[,-"classe"]); diag(M) <- 0
+print(paste('Maximum pairwise correlations between', round(min(M), 2), 'and', round(max(M), 2)))
+# Reset the seed for reproducible results
+set.seed(SEED_NUM)
+system.time(model_gbm1 <- train(classe ~., data=training1, method="gbm", trControl=fitControl, verbose=FALSE, preProcess=c("center","scale")))
+train_pred <- predict(model_gbm1, newdata=training1)
+valid_pred  <- predict(model_gbm1, newdata=valid)
+print(paste('Overall accuracy in training subset =', round(100*length(which(train_pred==training1$classe))/length(training1$classe)),'%'))
+print(paste('Overall accuracy in validation subset =', round(100*length(which(valid_pred==valid$classe))/length(valid$classe)),'%'))
+```
+
+Note that there are four predictors in common with the reduced CART and Random Forests models:
+
+```{r}
+print(paste('Predictors in common between reduced Boosted Trees and CART models:',
+            paste0(setdiff(intersect(nms_gbm, nms_rpart), "classe"), collapse=', ')))
+print(paste('Predictors in common between reduced Boosted Trees and Random Forests models:',
+            paste0(setdiff(intersect(nms_gbm, nms_rf), "classe"), collapse=', ')))
+```
+
+The reduced model loses a little bit of accuracy on both training and validation sets.
+
+## Predictions for the 'Prediction Quiz' Questionnaire
+
+Out of the 6 models considered above (3 model types X 2 sets of predictors) we would choose the reduced Random Forests model stored in object `model_rf1` which uses the 8 predictors whose names were stored in object `nms_rf`.
+
+We list below the results when applying the 6 models to predict the 20 test cases available in the test data stored in object `tst_data`. From this table we can see for example that:
+
+(a) The reduced CART and Random Forests models are equivalent to the respective full models, whereas the full and reduced Boosted Trees models differ by 3 predictions
+(b) The CART and Random Forests models differ by 11 predictions, as do the full CART and Boosted Trees models, whereas the reduced CART and Boosted Trees models differ by 10 predictions
+(c) The full Random Forests and Boosted Trees models differ by only 1 prediction, whereas the reduced models differ by 3 predictions
+
+```{r, message=FALSE}
+library(knitr)
+```
+```{r}
+kable(data.frame(problem_id=tst_data$problem_id,
+                 classe_rpart=predict(model_rpart, newdata=tst_data),
+                 classe_rpart1=predict(model_rpart1, newdata=tst_data),
+                 classe_rf=predict(model_rf, newdata=tst_data),
+                 classe_rf1=predict(model_rf1, newdata=tst_data),
+                 classe_gbm=predict(model_gbm, newdata=tst_data),
+                 classe_gbm1=predict(model_gbm1, newdata=tst_data)), align='c')
+```
